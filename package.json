@@ -1,0 +1,16 @@
+{
+  "name": "crowd-protocol-server",
+  "version": "1.0.0",
+  "description": "Backend server for CROWD PROTOCOL",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
