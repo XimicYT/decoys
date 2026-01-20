@@ -1,16 +1,16 @@
 {
   "name": "crowd-protocol-server",
-  "version": "1.0.0",
-  "description": "Backend server for CROWD PROTOCOL",
+  "version": "10.0.0",
+  "description": "Crowd Protocol V10 Optimized Backend",
   "main": "server.js",
-  "type": "module",
   "scripts": {
     "start": "node server.js"
   },
-  "engines": {
-    "node": ">=18"
-  },
   "dependencies": {
-    "ws": "^8.16.0"
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2"
+  },
+  "engines": {
+    "node": ">=16.0.0"
   }
 }
