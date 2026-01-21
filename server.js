@@ -17,10 +17,11 @@ const GAME_WIDTH = 2000;
 const GAME_HEIGHT = 2000;
 const TICK_RATE = 30; 
 const CONFIG = {
-  baseNPCs: 30,         // Slightly more decoys
+  baseNPCs: 30,
   npcsPerPlayer: 10,
   npcSpeed: 170,
   sprintSpeed: 300,
+  spectatorSpeed: 600, // Super fast for ghosts
   hunterAmmo: 3,
   gameDuration: 120,
 };
@@ -50,7 +51,7 @@ function resetGame() {
   const playerIds = Object.keys(gameState.players);
   const totalNPCs = CONFIG.baseNPCs + (playerIds.length * CONFIG.npcsPerPlayer);
 
-  // Generate Decoys
+  // 1. Generate Decoys
   for (let i = 0; i < totalNPCs; i++) {
     const pos = randomPos();
     gameState.npcs.push({
@@ -62,88 +63,112 @@ function resetGame() {
     });
   }
 
-  // Reset Players
+  // 2. Assign Hunter
+  let hunterId = null;
+  if (playerIds.length > 0) {
+    hunterId = playerIds[Math.floor(Math.random() * playerIds.length)];
+  }
+
+  // 3. Position Players (Safe Spawning)
   playerIds.forEach((id) => {
     const p = gameState.players[id];
-    const pos = randomPos();
-    p.x = pos.x; p.y = pos.y;
     p.dead = false; p.ammo = 0; p.idleTime = 0; p.stamina = 100;
-    p.role = "hider"; 
-    p.color = "#00ffcc"; // Everyone defaults to Decoy color (for disguise)
+    p.role = (id === hunterId) ? "hunter" : "hider";
+    p.color = "#00ffcc"; 
     p.mark = 0;
-  });
+    if (p.role === "hunter") p.ammo = CONFIG.hunterAmmo;
 
-  // Assign Hunter
-  if (playerIds.length > 0) {
-    const hunterId = playerIds[Math.floor(Math.random() * playerIds.length)];
-    gameState.players[hunterId].role = "hunter";
-    gameState.players[hunterId].ammo = CONFIG.hunterAmmo;
-    // NOTE: We keep server color #00ffcc so clients don't see who hunter is.
-    // The Hunter knows they are hunter via 'role' property.
-  }
+    // Position Logic
+    let pos = randomPos();
+    
+    // If Hider, ensure not too close to Hunter
+    if (p.role === "hider" && hunterId) {
+        const hunterP = gameState.players[hunterId];
+        let attempts = 0;
+        let dist = 0;
+        // Keep retrying until distance > 800 or 10 attempts
+        do {
+            pos = randomPos();
+            const dx = pos.x - hunterP.x;
+            const dy = pos.y - hunterP.y;
+            dist = Math.sqrt(dx*dx + dy*dy);
+            attempts++;
+        } while (dist < 800 && attempts < 10);
+    }
+
+    p.x = pos.x; p.y = pos.y;
+  });
 }
 
 io.on("connection", (socket) => {
   console.log("Connect:", socket.id);
-
-  // Send init data immediately so they can see the map/menu
+  
+  // Send init immediately
   socket.emit("init", { id: socket.id, width: GAME_WIDTH, height: GAME_HEIGHT });
 
-  // NEW: Only create the player object when they explicitly join
   socket.on("joinGame", (data) => {
-    // Prevent double joining
     if (gameState.players[socket.id]) return;
+
+    // Sanitize Name
+    let cleanName = (data.name || "AGENT").replace(/[^a-zA-Z0-9 ]/g, "").substring(0, 14);
+    if(cleanName.length === 0) cleanName = "AGENT";
 
     gameState.players[socket.id] = {
       id: socket.id,
       x: GAME_WIDTH / 2, y: GAME_HEIGHT / 2,
-      role: "hider", 
-      color: "#ffffff", 
-      dead: false,
-      name: "Agent " + socket.id.substr(0, 4), // You could pass a name from client here later
-      host: Object.keys(gameState.players).length === 0, // First to JOIN is host
-      activeSlot: 1, 
-      stamina: 100
+      role: "hider", color: "#ffffff", dead: false,
+      name: cleanName,
+      host: Object.keys(gameState.players).length === 0, 
+      activeSlot: 1, stamina: 100
     };
   });
 
   socket.on("input", (input) => {
     const p = gameState.players[socket.id];
-    // Added check: if (!p) return; to ensure spectators don't crash server
-    if (!p || p.dead || gameState.status !== "PLAYING") return;
+    // If player doesn't exist, ignore
+    if (!p) return;
+    
+    // If Game not playing, ignore
+    if (gameState.status !== "PLAYING") return;
 
     if (input.slot) p.activeSlot = input.slot;
 
     // --- MOVEMENT ---
     let speed = CONFIG.npcSpeed; 
-    if (p.role === "hunter") speed *= 1.1; 
-
-    // Sprint Logic
-    let isMoving = (input.dx !== 0 || input.dy !== 0);
-    let isSprinting = input.sprint && p.stamina > 0 && isMoving;
     
-    if (isSprinting) {
-        speed = CONFIG.sprintSpeed;
-        p.stamina = Math.max(0, p.stamina - 1.5); 
+    // Spectator Speed Logic
+    if (p.dead) {
+        speed = CONFIG.spectatorSpeed;
     } else {
-        p.stamina = Math.min(100, p.stamina + 0.5); 
+        if (p.role === "hunter") speed *= 1.1; 
+        
+        let isMoving = (input.dx !== 0 || input.dy !== 0);
+        let isSprinting = input.sprint && p.stamina > 0 && isMoving;
+        
+        if (isSprinting) {
+            speed = CONFIG.sprintSpeed;
+            p.stamina = Math.max(0, p.stamina - 1.5); 
+        } else {
+            p.stamina = Math.min(100, p.stamina + 0.5); 
+        }
+        if (!isMoving) p.idleTime += 1 / TICK_RATE;
+        else p.idleTime = 0;
     }
 
-    if (isMoving) {
+    if (input.dx !== 0 || input.dy !== 0) {
       const lenSq = input.dx*input.dx + input.dy*input.dy;
       const len = Math.sqrt(lenSq); 
       p.x += (input.dx / len) * speed * (1 / TICK_RATE);
       p.y += (input.dy / len) * speed * (1 / TICK_RATE);
-      p.idleTime = 0;
-    } else {
-      p.idleTime += 1 / TICK_RATE;
     }
 
     // Bounds
     p.x = Math.max(20, Math.min(GAME_WIDTH - 20, p.x));
     p.y = Math.max(20, Math.min(GAME_HEIGHT - 20, p.y));
 
-    // --- SHOOTING / MARKING ---
+    // --- SHOOTING (Alive Only) ---
+    if (p.dead) return; // Ghosts cannot shoot
+
     if (input.shoot && p.role === "hunter") {
         if (p.activeSlot === 1 && p.ammo > 0) {
             p.ammo--;
@@ -158,8 +183,6 @@ io.on("connection", (socket) => {
         else if (p.activeSlot === 2) {
             const clickRadiusSq = 3600; 
             let hitFound = false;
-
-            // Check NPCs
             for (let n of gameState.npcs) {
                 const dx = n.x - input.aimX;
                 const dy = n.y - input.aimY;
@@ -168,7 +191,6 @@ io.on("connection", (socket) => {
                     hitFound = true; break; 
                 }
             }
-            // Check Players
             if (!hitFound) {
                 for (let pid in gameState.players) {
                     const target = gameState.players[pid];
@@ -185,7 +207,6 @@ io.on("connection", (socket) => {
 
   socket.on("startGame", () => {
     const p = gameState.players[socket.id];
-    // Check if player exists (is joined) and is host
     if (p && p.host && gameState.status !== "PLAYING") {
       if (Object.keys(gameState.players).length < 2) return;
       resetGame();
@@ -196,11 +217,9 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     if (gameState.players[socket.id]) {
         delete gameState.players[socket.id];
-        // Reassign host if needed
         if (Object.keys(gameState.players).length > 0) {
             gameState.players[Object.keys(gameState.players)[0]].host = true;
         }
-        // End game if not enough players
         if (gameState.status === "PLAYING" && Object.keys(gameState.players).length < 2) {
             gameState.status = "ENDED";
             io.emit("gameOver", { reason: "NOT ENOUGH PLAYERS", hunterWon: false });
@@ -235,7 +254,6 @@ setInterval(() => {
             n.x += n.moveX * speed * dMult * dt;
             n.y += n.moveY * speed * dMult * dt;
             
-            // Wall Bouncing (Simple)
             if (n.x < 20) { n.x = 20; n.moveX *= -1; }
             else if (n.x > GAME_WIDTH - 20) { n.x = GAME_WIDTH - 20; n.moveX *= -1; }
             if (n.y < 20) { n.y = 20; n.moveY *= -1; }
@@ -271,6 +289,7 @@ setInterval(() => {
         // Check Player Hits
         for(let pid in gameState.players) {
             const p = gameState.players[pid];
+            // Only kill Living Hiders
             if (p.role === "hider" && !p.dead) {
                 const dx = p.x - b.x, dy = p.y - b.y;
                 if ((dx*dx + dy*dy) < hitRadiusSq) {
@@ -305,7 +324,6 @@ setInterval(() => {
     }
   }
 
-  // Optimize Packet Size
   io.emit("tick", {
     players: gameState.players, 
     npcs: gameState.npcs.map(n => ({ x: (n.x|0), y: (n.y|0), dead: n.dead, color: n.color, mark: n.mark })), 
