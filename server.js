@@ -86,26 +86,37 @@ function resetGame() {
 io.on("connection", (socket) => {
   console.log("Connect:", socket.id);
 
-  gameState.players[socket.id] = {
-    id: socket.id,
-    x: GAME_WIDTH / 2, y: GAME_HEIGHT / 2,
-    role: "hider", color: "#ffffff", dead: false,
-    name: "Agent " + socket.id.substr(0, 4),
-    host: Object.keys(gameState.players).length === 0, 
-    activeSlot: 1, stamina: 100
-  };
-
+  // Send init data immediately so they can see the map/menu
   socket.emit("init", { id: socket.id, width: GAME_WIDTH, height: GAME_HEIGHT });
+
+  // NEW: Only create the player object when they explicitly join
+  socket.on("joinGame", (data) => {
+    // Prevent double joining
+    if (gameState.players[socket.id]) return;
+
+    gameState.players[socket.id] = {
+      id: socket.id,
+      x: GAME_WIDTH / 2, y: GAME_HEIGHT / 2,
+      role: "hider", 
+      color: "#ffffff", 
+      dead: false,
+      name: "Agent " + socket.id.substr(0, 4), // You could pass a name from client here later
+      host: Object.keys(gameState.players).length === 0, // First to JOIN is host
+      activeSlot: 1, 
+      stamina: 100
+    };
+  });
 
   socket.on("input", (input) => {
     const p = gameState.players[socket.id];
+    // Added check: if (!p) return; to ensure spectators don't crash server
     if (!p || p.dead || gameState.status !== "PLAYING") return;
 
     if (input.slot) p.activeSlot = input.slot;
 
     // --- MOVEMENT ---
     let speed = CONFIG.npcSpeed; 
-    if (p.role === "hunter") speed *= 1.1; // Hunter is 10% faster base
+    if (p.role === "hunter") speed *= 1.1; 
 
     // Sprint Logic
     let isMoving = (input.dx !== 0 || input.dy !== 0);
@@ -121,7 +132,6 @@ io.on("connection", (socket) => {
     if (isMoving) {
       const lenSq = input.dx*input.dx + input.dy*input.dy;
       const len = Math.sqrt(lenSq); 
-      // Normalize and move
       p.x += (input.dx / len) * speed * (1 / TICK_RATE);
       p.y += (input.dy / len) * speed * (1 / TICK_RATE);
       p.idleTime = 0;
@@ -136,7 +146,6 @@ io.on("connection", (socket) => {
     // --- SHOOTING / MARKING ---
     if (input.shoot && p.role === "hunter") {
         if (p.activeSlot === 1 && p.ammo > 0) {
-            // FIRE BULLET
             p.ammo--;
             const angle = Math.atan2(input.aimY - p.y, input.aimX - p.x);
             gameState.bullets.push({
@@ -147,11 +156,10 @@ io.on("connection", (socket) => {
             gameState.events.push({ type: "sound", name: "shoot" });
         } 
         else if (p.activeSlot === 2) {
-            // MARK TARGET (Cheap collision check)
             const clickRadiusSq = 3600; 
             let hitFound = false;
 
-            // Check NPCs first
+            // Check NPCs
             for (let n of gameState.npcs) {
                 const dx = n.x - input.aimX;
                 const dy = n.y - input.aimY;
@@ -160,7 +168,7 @@ io.on("connection", (socket) => {
                     hitFound = true; break; 
                 }
             }
-            // Check Players if no NPC hit
+            // Check Players
             if (!hitFound) {
                 for (let pid in gameState.players) {
                     const target = gameState.players[pid];
@@ -177,6 +185,7 @@ io.on("connection", (socket) => {
 
   socket.on("startGame", () => {
     const p = gameState.players[socket.id];
+    // Check if player exists (is joined) and is host
     if (p && p.host && gameState.status !== "PLAYING") {
       if (Object.keys(gameState.players).length < 2) return;
       resetGame();
@@ -185,11 +194,17 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", () => {
-    delete gameState.players[socket.id];
-    if (Object.keys(gameState.players).length > 0) gameState.players[Object.keys(gameState.players)[0]].host = true;
-    if (gameState.status === "PLAYING" && Object.keys(gameState.players).length < 2) {
-      gameState.status = "ENDED";
-      io.emit("gameOver", { reason: "NOT ENOUGH PLAYERS", hunterWon: false });
+    if (gameState.players[socket.id]) {
+        delete gameState.players[socket.id];
+        // Reassign host if needed
+        if (Object.keys(gameState.players).length > 0) {
+            gameState.players[Object.keys(gameState.players)[0]].host = true;
+        }
+        // End game if not enough players
+        if (gameState.status === "PLAYING" && Object.keys(gameState.players).length < 2) {
+            gameState.status = "ENDED";
+            io.emit("gameOver", { reason: "NOT ENOUGH PLAYERS", hunterWon: false });
+        }
     }
   });
 });
