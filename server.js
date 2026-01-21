@@ -1,305 +1,373 @@
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
-const cors = require("cors");
-
+const express = require('express');
 const app = express();
-app.use(cors());
-
+const http = require('http');
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] },
-  transports: ["websocket", "polling"],
-});
+const { Server } = require("socket.io");
+const io = new Server(server, { cors: { origin: "*" } });
+
+app.use(express.static("public"));
 
 // --- CONSTANTS ---
 const GAME_WIDTH = 2000;
 const GAME_HEIGHT = 2000;
-const TICK_RATE = 30; 
-const CONFIG = {
-  baseNPCs: 30,         // Slightly more decoys
-  npcsPerPlayer: 10,
-  npcSpeed: 170,
-  sprintSpeed: 300,
-  hunterAmmo: 3,
-  gameDuration: 120,
-};
+const PLAYER_RADIUS = 20;
 
-let gameState = {
-  status: "LOBBY",
-  players: {}, 
-  npcs: [],
-  bullets: [],
-  timer: 0,
-  events: [], 
-};
+// --- STATE ---
+let players = {};
+let npcs = [];
+let bullets = [];
+let walls = [];
+let gameTimer = 0;
+let gameRunning = false;
+let gameInterval;
 
-// Integers are faster to send
-const randomPos = () => ({
-  x: Math.floor(Math.random() * (GAME_WIDTH - 100) + 50),
-  y: Math.floor(Math.random() * (GAME_HEIGHT - 100) + 50),
-});
-
-function resetGame() {
-  gameState.npcs = [];
-  gameState.bullets = [];
-  gameState.timer = CONFIG.gameDuration;
-  gameState.events = [];
-  gameState.status = "PLAYING";
-
-  const playerIds = Object.keys(gameState.players);
-  const totalNPCs = CONFIG.baseNPCs + (playerIds.length * CONFIG.npcsPerPlayer);
-
-  // Generate Decoys
-  for (let i = 0; i < totalNPCs; i++) {
-    const pos = randomPos();
-    gameState.npcs.push({
-      id: `npc_${i}`,
-      x: pos.x, y: pos.y,
-      moveX: 0, moveY: 0, moveTimer: 0, sprinting: false,
-      color: "#00ffcc", // Decoy Color
-      mark: 0, dead: false,
-    });
-  }
-
-  // Reset Players
-  playerIds.forEach((id) => {
-    const p = gameState.players[id];
-    const pos = randomPos();
-    p.x = pos.x; p.y = pos.y;
-    p.dead = false; p.ammo = 0; p.idleTime = 0; p.stamina = 100;
-    p.role = "hider"; 
-    p.color = "#00ffcc"; // Everyone defaults to Decoy color (for disguise)
-    p.mark = 0;
-  });
-
-  // Assign Hunter
-  if (playerIds.length > 0) {
-    const hunterId = playerIds[Math.floor(Math.random() * playerIds.length)];
-    gameState.players[hunterId].role = "hunter";
-    gameState.players[hunterId].ammo = CONFIG.hunterAmmo;
-    // NOTE: We keep server color #00ffcc so clients don't see who hunter is.
-    // The Hunter knows they are hunter via 'role' property.
-  }
+// --- WALL GENERATION ---
+function generateWalls() {
+    walls = [];
+    const count = 15; // Number of walls to spawn
+    
+    for (let i = 0; i < count; i++) {
+        // Random dimensions (50px to 250px)
+        const w = Math.random() * 200 + 50;
+        const h = Math.random() * 200 + 50;
+        
+        // Random position (padded from edge to avoid spawning inside map borders)
+        const x = Math.random() * (GAME_WIDTH - w - 200) + 100;
+        const y = Math.random() * (GAME_HEIGHT - h - 200) + 100;
+        
+        walls.push({ x, y, w, h });
+    }
 }
 
-io.on("connection", (socket) => {
-  console.log("Connect:", socket.id);
+// Generate walls immediately on server start
+generateWalls();
 
-  gameState.players[socket.id] = {
-    id: socket.id,
-    x: GAME_WIDTH / 2, y: GAME_HEIGHT / 2,
-    role: "hider", color: "#ffffff", dead: false,
-    name: "Agent " + socket.id.substr(0, 4),
-    host: Object.keys(gameState.players).length === 0, 
-    activeSlot: 1, stamina: 100
-  };
-
-  socket.emit("init", { id: socket.id, width: GAME_WIDTH, height: GAME_HEIGHT });
-
-  socket.on("input", (input) => {
-    const p = gameState.players[socket.id];
-    if (!p || p.dead || gameState.status !== "PLAYING") return;
-
-    if (input.slot) p.activeSlot = input.slot;
-
-    // --- MOVEMENT ---
-    let speed = CONFIG.npcSpeed; 
-    if (p.role === "hunter") speed *= 1.1; // Hunter is 10% faster base
-
-    // Sprint Logic
-    let isMoving = (input.dx !== 0 || input.dy !== 0);
-    let isSprinting = input.sprint && p.stamina > 0 && isMoving;
-    
-    if (isSprinting) {
-        speed = CONFIG.sprintSpeed;
-        p.stamina = Math.max(0, p.stamina - 1.5); 
-    } else {
-        p.stamina = Math.min(100, p.stamina + 0.5); 
+// --- COLLISION LOGIC ---
+// Returns true if the point (x, y) with PLAYER_RADIUS hits a wall
+function checkWallCollision(x, y) {
+    for (let wall of walls) {
+        // AABB Collision (Axis-Aligned Bounding Box)
+        // We expand the wall box by the player radius to act as a buffer
+        if (x + PLAYER_RADIUS > wall.x && 
+            x - PLAYER_RADIUS < wall.x + wall.w &&
+            y + PLAYER_RADIUS > wall.y && 
+            y - PLAYER_RADIUS < wall.y + wall.h) {
+            return true;
+        }
     }
+    return false;
+}
 
-    if (isMoving) {
-      const lenSq = input.dx*input.dx + input.dy*input.dy;
-      const len = Math.sqrt(lenSq); 
-      // Normalize and move
-      p.x += (input.dx / len) * speed * (1 / TICK_RATE);
-      p.y += (input.dy / len) * speed * (1 / TICK_RATE);
-      p.idleTime = 0;
-    } else {
-      p.idleTime += 1 / TICK_RATE;
+// Helper to get a safe spawn point
+function getSafeSpawn() {
+    let x, y;
+    let attempts = 0;
+    do {
+        x = Math.random() * (GAME_WIDTH - 100) + 50;
+        y = Math.random() * (GAME_HEIGHT - 100) + 50;
+        attempts++;
+    } while (checkWallCollision(x, y) && attempts < 100);
+    return { x, y };
+}
+
+function spawnNPCs(count) {
+    npcs = [];
+    for (let i = 0; i < count; i++) {
+        const spawn = getSafeSpawn();
+        
+        npcs.push({
+            id: `npc-${i}`,
+            x: spawn.x,
+            y: spawn.y,
+            tx: spawn.x, // Target X (where it wants to go)
+            ty: spawn.y, // Target Y
+            dead: false,
+            color: getRandomColor(),
+            role: "hider",
+            idleTime: Math.random() * 5,
+            mark: 0
+        });
     }
+}
 
-    // Bounds
-    p.x = Math.max(20, Math.min(GAME_WIDTH - 20, p.x));
-    p.y = Math.max(20, Math.min(GAME_HEIGHT - 20, p.y));
+function getRandomColor() {
+    const colors = ["#ff0055", "#00ffcc", "#ffff00", "#00ccff", "#ff9900", "#cc00ff"];
+    return colors[Math.floor(Math.random() * colors.length)];
+}
 
-    // --- SHOOTING / MARKING ---
-    if (input.shoot && p.role === "hunter") {
-        if (p.activeSlot === 1 && p.ammo > 0) {
-            // FIRE BULLET
-            p.ammo--;
-            const angle = Math.atan2(input.aimY - p.y, input.aimX - p.x);
-            gameState.bullets.push({
-                x: p.x, y: p.y,
-                vx: Math.cos(angle) * 1000, vy: Math.sin(angle) * 1000,
-                life: 1.5, owner: p.id,
-            });
-            gameState.events.push({ type: "sound", name: "shoot" });
-        } 
-        else if (p.activeSlot === 2) {
-            // MARK TARGET (Cheap collision check)
-            const clickRadiusSq = 3600; 
-            let hitFound = false;
+// --- SOCKET CONNECTION ---
+io.on('connection', (socket) => {
+    console.log('Player connected:', socket.id);
 
-            // Check NPCs first
-            for (let n of gameState.npcs) {
-                const dx = n.x - input.aimX;
-                const dy = n.y - input.aimY;
-                if (!n.dead && (dx*dx + dy*dy) < clickRadiusSq) {
-                    n.mark = (n.mark + 1) % 4; 
-                    hitFound = true; break; 
-                }
+    // 1. Send Init Data (Includes Walls)
+    socket.emit('init', { id: socket.id, walls: walls });
+
+    // 2. Spawn Player Safely
+    const spawn = getSafeSpawn();
+
+    players[socket.id] = {
+        x: spawn.x,
+        y: spawn.y,
+        dead: false,
+        color: "#fff", // White until game starts
+        role: "hider",
+        name: "Agent " + Math.floor(Math.random() * 1000),
+        host: Object.keys(players).length === 0, // First player is host
+        ammo: 0,
+        stamina: 100,
+        lastSprint: 0
+    };
+
+    // 3. Handle Input
+    socket.on('input', (data) => {
+        const p = players[socket.id];
+        if (!p || p.dead) return;
+
+        // --- Movement ---
+        if (gameRunning && (data.dx !== 0 || data.dy !== 0)) {
+            let speed = 170; // Base speed
+            if (p.role === "hunter") speed *= 1.1; // Hunter is slightly faster
+            
+            // Sprint Logic
+            if (data.sprint && p.stamina > 0) {
+                speed = 300;
+                p.stamina = Math.max(0, p.stamina - 2); 
+                p.lastSprint = Date.now();
             }
-            // Check Players if no NPC hit
-            if (!hitFound) {
-                for (let pid in gameState.players) {
-                    const target = gameState.players[pid];
-                    const dx = target.x - input.aimX;
-                    const dy = target.y - input.aimY;
-                    if (target.role === "hider" && !target.dead && (dx*dx + dy*dy) < clickRadiusSq) {
-                        target.mark = (target.mark + 1) % 4; break;
-                    }
+
+            // Normalization
+            const len = Math.hypot(data.dx, data.dy);
+            const moveX = (data.dx / len) * speed * (1 / 30);
+            const moveY = (data.dy / len) * speed * (1 / 30);
+
+            // X-Axis Move & Check
+            if (!checkWallCollision(p.x + moveX, p.y)) {
+                p.x += moveX;
+            }
+            // Y-Axis Move & Check
+            if (!checkWallCollision(p.x, p.y + moveY)) {
+                p.y += moveY;
+            }
+
+            // Boundary Checks
+            p.x = Math.max(20, Math.min(GAME_WIDTH - 20, p.x));
+            p.y = Math.max(20, Math.min(GAME_HEIGHT - 20, p.y));
+        } else {
+            // Stamina Regen
+            if (Date.now() - p.lastSprint > 1000 && p.stamina < 100) {
+                p.stamina = Math.min(100, p.stamina + 1);
+            }
+        }
+
+        // --- Shooting (Slot 1) ---
+        if (data.shoot && p.role === "hunter" && p.ammo > 0 && data.slot === 1) {
+            p.ammo--;
+            const angle = Math.atan2(data.aimY - p.y, data.aimX - p.x);
+            bullets.push({ 
+                x: p.x, 
+                y: p.y, 
+                vx: Math.cos(angle) * 1000, 
+                vy: Math.sin(angle) * 1000, 
+                owner: socket.id 
+            });
+            // Send shake effect
+            io.emit("events", [{ type: "shake", amount: 5 }]);
+        }
+
+        // --- Marking (Slot 2) ---
+        if (data.shoot && p.role === "hunter" && data.slot === 2) {
+            // Check NPCs
+            npcs.forEach(npc => {
+                if (!npc.dead && Math.hypot(npc.x - data.aimX, npc.y - data.aimY) < 30) {
+                    npc.mark = (npc.mark + 1) % 4;
+                }
+            });
+            // Check Players
+            for(let pid in players) {
+                const target = players[pid];
+                if (pid !== socket.id && !target.dead && Math.hypot(target.x - data.aimX, target.y - data.aimY) < 30) {
+                    target.mark = (target.mark || 0) + 1;
+                    if(target.mark > 3) target.mark = 0;
                 }
             }
         }
-    }
-  });
+    });
 
-  socket.on("startGame", () => {
-    const p = gameState.players[socket.id];
-    if (p && p.host && gameState.status !== "PLAYING") {
-      if (Object.keys(gameState.players).length < 2) return;
-      resetGame();
-      io.emit("gameStart");
-    }
-  });
+    // 4. Start Game Handler
+    socket.on('startGame', () => {
+        if (players[socket.id] && players[socket.id].host && !gameRunning) {
+            startGame();
+        }
+    });
 
-  socket.on("disconnect", () => {
-    delete gameState.players[socket.id];
-    if (Object.keys(gameState.players).length > 0) gameState.players[Object.keys(gameState.players)[0]].host = true;
-    if (gameState.status === "PLAYING" && Object.keys(gameState.players).length < 2) {
-      gameState.status = "ENDED";
-      io.emit("gameOver", { reason: "NOT ENOUGH PLAYERS", hunterWon: false });
-    }
-  });
+    // 5. Disconnect Handler
+    socket.on('disconnect', () => {
+        console.log('Player disconnected:', socket.id);
+        delete players[socket.id];
+        
+        // If no players left, stop game
+        if (Object.keys(players).length === 0) {
+            stopGame();
+        } 
+        // If host left, assign new host
+        else if (!Object.values(players).some(p => p.host)) {
+             const nextId = Object.keys(players)[0];
+             if(nextId) players[nextId].host = true;
+        }
+    });
 });
 
-setInterval(() => {
-  if (gameState.status === "PLAYING") {
-    const dt = 1 / TICK_RATE;
-    gameState.timer -= dt;
+// --- GAME LOGIC ---
 
-    // NPC Logic
-    for(let n of gameState.npcs) {
-        if (n.dead) continue;
-        if (n.moveTimer <= 0) {
-            n.moveTimer = Math.random() * 2.0 + 0.5; 
-            if (Math.random() < 0.2) { 
-                n.moveX = 0; n.moveY = 0; n.sprinting = false;
-            } else { 
-                n.moveX = Math.floor(Math.random() * 3) - 1; 
-                n.moveY = Math.floor(Math.random() * 3) - 1;
-                n.sprinting = Math.random() < 0.3;
-            }
-        }
-        n.moveTimer -= dt;
+function startGame() {
+    gameRunning = true;
+    gameTimer = 180; // 3 Minutes
+    
+    // Regenerate walls for a fresh map layout
+    generateWalls();
+    
+    // Assign Roles
+    const ids = Object.keys(players);
+    const hunterId = ids[Math.floor(Math.random() * ids.length)];
+    
+    for (let id in players) {
+        players[id].role = (id === hunterId) ? "hunter" : "hider";
+        players[id].dead = false;
+        players[id].color = getRandomColor();
+        players[id].ammo = (id === hunterId) ? 6 : 0; // Hunter gets 6 shots
+        players[id].stamina = 100;
+        players[id].mark = 0;
 
-        if (n.moveX !== 0 || n.moveY !== 0) {
-            let dMult = (n.moveX !== 0 && n.moveY !== 0) ? 0.7071 : 1;
-            const speed = n.sprinting ? CONFIG.sprintSpeed : CONFIG.npcSpeed;
-            n.x += n.moveX * speed * dMult * dt;
-            n.y += n.moveY * speed * dMult * dt;
-            
-            // Wall Bouncing (Simple)
-            if (n.x < 20) { n.x = 20; n.moveX *= -1; }
-            else if (n.x > GAME_WIDTH - 20) { n.x = GAME_WIDTH - 20; n.moveX *= -1; }
-            if (n.y < 20) { n.y = 20; n.moveY *= -1; }
-            else if (n.y > GAME_HEIGHT - 20) { n.y = GAME_HEIGHT - 20; n.moveY *= -1; }
-        }
+        // Respawn everyone at safe locations
+        const s = getSafeSpawn();
+        players[id].x = s.x;
+        players[id].y = s.y;
+    }
+    
+    spawnNPCs(40);
+    
+    // Resend walls (since we regenerated them) and start signal
+    io.emit("init", { walls: walls }); 
+    io.emit("gameStart");
+    
+    // Start Loop
+    clearInterval(gameInterval);
+    gameInterval = setInterval(gameLoop, 1000 / 30);
+}
+
+function stopGame() {
+    gameRunning = false;
+    clearInterval(gameInterval);
+}
+
+function gameLoop() {
+    const events = [];
+
+    // 1. Timer Logic
+    if (gameTimer > 0) {
+        gameTimer -= 1/30;
+        if (gameTimer <= 0) endGame(false, "TIME EXPIRED");
     }
 
-    // Bullet Logic
-    const hitRadiusSq = 625; 
-    for(let i = gameState.bullets.length - 1; i >= 0; i--) {
-        const b = gameState.bullets[i];
-        b.x += b.vx * dt;
-        b.y += b.vy * dt;
-        b.life -= dt;
+    // 2. Check Win Condition (All hiders dead)
+    if (gameRunning) {
+        const hiders = Object.values(players).filter(p => p.role === "hider" && !p.dead);
+        if (hiders.length === 0) endGame(true, "ALL TARGETS ELIMINATED");
+    }
 
-        if (b.life <= 0) { gameState.bullets.splice(i, 1); continue; }
+    // 3. NPC Logic (AI)
+    npcs.forEach(npc => {
+        if (npc.dead) return;
+        
+        const dx = npc.tx - npc.x;
+        const dy = npc.ty - npc.y;
+        const dist = Math.hypot(dx, dy);
+        
+        // If arrived at target or waiting
+        if (dist < 5 || npc.idleTime > 0) {
+            if (npc.idleTime > 0) {
+                npc.idleTime -= 1/30;
+            } else {
+                // Pick new target
+                if (Math.random() < 0.02) { // Small chance per frame to move
+                    const dest = getSafeSpawn(); // Ensures target isn't inside a wall
+                    npc.tx = dest.x;
+                    npc.ty = dest.y;
+                } else {
+                    npc.idleTime = Math.random() * 2 + 1; // Wait 1-3 seconds
+                }
+            }
+        } else {
+            // Move towards target
+            const speed = 170 * (1/30);
+            const moveX = (dx / dist) * speed;
+            const moveY = (dy / dist) * speed;
+            
+            // Wall Slide Logic for NPCs
+            if (!checkWallCollision(npc.x + moveX, npc.y)) npc.x += moveX;
+            if (!checkWallCollision(npc.x, npc.y + moveY)) npc.y += moveY;
+        }
+    });
+
+    // 4. Bullet Logic
+    for (let i = bullets.length - 1; i >= 0; i--) {
+        let b = bullets[i];
+        b.x += b.vx * (1/30);
+        b.y += b.vy * (1/30);
 
         let hit = false;
-        // Check NPC Hits
-        for(let n of gameState.npcs) {
-            if (n.dead) continue;
-            const dx = n.x - b.x, dy = n.y - b.y;
-            if ((dx*dx + dy*dy) < hitRadiusSq) {
-                n.dead = true; hit = true;
-                gameState.events.push({ type: "kill", x: n.x, y: n.y, color: n.color });
-                gameState.events.push({ type: "msg", text: "CIVILIAN CASUALTY" });
-                gameState.events.push({ type: "shake", amount: 10 });
-                break; 
-            }
-        }
-        if(hit) { b.life = 0; gameState.bullets.splice(i, 1); continue; }
 
-        // Check Player Hits
-        for(let pid in gameState.players) {
-            const p = gameState.players[pid];
-            if (p.role === "hider" && !p.dead) {
-                const dx = p.x - b.x, dy = p.y - b.y;
-                if ((dx*dx + dy*dy) < hitRadiusSq) {
-                    p.dead = true; hit = true;
-                    gameState.events.push({ type: "kill", x: p.x, y: p.y, color: p.color });
-                    gameState.events.push({ type: "msg", text: "TARGET ELIMINATED" });
-                    gameState.events.push({ type: "shake", amount: 20 });
-                    break;
+        // Check Wall Collision
+        if (b.x < 0 || b.x > GAME_WIDTH || b.y < 0 || b.y > GAME_HEIGHT || checkWallCollision(b.x, b.y)) {
+            hit = true;
+        }
+
+        // Check Player Collision
+        if (!hit) {
+            for (let pid in players) {
+                const p = players[pid];
+                if (!p.dead && pid !== b.owner && Math.hypot(p.x - b.x, p.y - b.y) < PLAYER_RADIUS) {
+                    p.dead = true;
+                    hit = true;
+                    events.push({ type: "kill", x: p.x, y: p.y, color: p.color });
+                    
+                    if (p.role === "hunter") endGame(false, "HUNTER DIED"); // Friendly fire or ricochet (unlikely but safe)
                 }
             }
         }
-        if(hit || b.life <= 0) gameState.bullets.splice(i, 1);
+
+        // Check NPC Collision
+        if (!hit) {
+            for (let n of npcs) {
+                if (!n.dead && Math.hypot(n.x - b.x, n.y - b.y) < PLAYER_RADIUS) {
+                    n.dead = true;
+                    hit = true;
+                    events.push({ type: "kill", x: n.x, y: n.y, color: n.color });
+                    
+                    // Penalty for Hunter killing wrong target? (Optional)
+                    // events.push({ type: "msg", text: "WRONG TARGET" });
+                }
+            }
+        }
+
+        if (hit) bullets.splice(i, 1);
     }
 
-    // Win Conditions
-    const allPlayers = Object.values(gameState.players);
-    const livingHiders = allPlayers.filter(p => p.role === "hider" && !p.dead);
-    const hunter = allPlayers.find(p => p.role === "hunter");
-    let gameOverReason = null; let hunterWon = false;
+    // 5. Send Update to Clients
+    io.emit("tick", {
+        players: players,
+        npcs: npcs,
+        bullets: bullets,
+        timer: gameTimer,
+        events: events
+    });
+}
 
-    if (livingHiders.length === 0 && allPlayers.some(p => p.role === "hider")) {
-        gameOverReason = "ALL TARGETS ELIMINATED"; hunterWon = true;
-    } else if (gameState.timer <= 0) {
-        gameOverReason = "TIME EXPIRED"; hunterWon = false;
-    } else if (hunter && hunter.ammo <= 0 && gameState.bullets.length === 0) {
-        gameOverReason = "OUT OF AMMO"; hunterWon = false;
-    }
+function endGame(hunterWon, reason) {
+    stopGame();
+    io.emit("gameOver", { hunterWon, reason });
+}
 
-    if (gameOverReason) {
-        gameState.status = "ENDED";
-        io.emit("gameOver", { reason: gameOverReason, hunterWon });
-    }
-  }
-
-  // Optimize Packet Size
-  io.emit("tick", {
-    players: gameState.players, 
-    npcs: gameState.npcs.map(n => ({ x: (n.x|0), y: (n.y|0), dead: n.dead, color: n.color, mark: n.mark })), 
-    bullets: gameState.bullets.map(b => ({ x: (b.x|0), y: (b.y|0), vx: b.vx, vy: b.vy })),
-    timer: Math.round(gameState.timer),
-    events: gameState.events 
-  });
-  gameState.events = [];
-}, 1000 / TICK_RATE);
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => { console.log(`Server running on port ${PORT}`); });
+server.listen(3000, () => {
+    console.log('Server running on *:3000');
+});
