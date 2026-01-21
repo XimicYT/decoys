@@ -8,10 +8,9 @@ app.use(cors());
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"],
-  },
+  cors: { origin: "*", methods: ["GET", "POST"] },
+  // Optimize socket transport
+  transports: ["websocket", "polling"], 
 });
 
 // --- CONSTANTS & CONFIG ---
@@ -21,8 +20,8 @@ const TICK_RATE = 30;
 const CONFIG = {
   baseNPCs: 20,
   npcsPerPlayer: 15,
-  npcSpeed: 170,      // Slightly slower base walk
-  sprintSpeed: 300,   // Fast sprint
+  npcSpeed: 170,
+  sprintSpeed: 300,
   hunterAmmo: 3,
   gameDuration: 120,
 };
@@ -36,9 +35,10 @@ let gameState = {
   events: [], 
 };
 
+// Helper: integers are cheaper to serialize
 const randomPos = () => ({
-  x: Math.random() * (GAME_WIDTH - 100) + 50,
-  y: Math.random() * (GAME_HEIGHT - 100) + 50,
+  x: Math.floor(Math.random() * (GAME_WIDTH - 100) + 50),
+  y: Math.floor(Math.random() * (GAME_HEIGHT - 100) + 50),
 });
 
 function resetGame() {
@@ -57,10 +57,8 @@ function resetGame() {
       id: `npc_${i}`,
       x: pos.x,
       y: pos.y,
-      moveX: 0, 
-      moveY: 0, 
-      moveTimer: 0, 
-      sprinting: false, // NPC sprint state
+      moveX: 0, moveY: 0, moveTimer: 0, 
+      sprinting: false,
       color: "#00ffcc",
       mark: 0, 
       dead: false,
@@ -76,7 +74,7 @@ function resetGame() {
     p.dead = false;
     p.ammo = 0;
     p.idleTime = 0;
-    p.stamina = 100; // Init Stamina
+    p.stamina = 100;
     p.role = "hider";
     p.color = "#00ffcc"; 
     p.mark = 0;
@@ -114,24 +112,23 @@ io.on("connection", (socket) => {
 
     if (input.slot) p.activeSlot = input.slot;
 
-    // STAMINA & SPEED LOGIC
-    let currentSpeed = CONFIG.npcSpeed; // Base speed
-    
-    // Hunter is naturally 10% faster than base
+    // STAMINA & SPEED
+    let currentSpeed = CONFIG.npcSpeed; 
     if (p.role === "hunter") currentSpeed *= 1.1;
 
-    // Sprint Logic
     let isMoving = input.dx !== 0 || input.dy !== 0;
     if (input.sprint && p.stamina > 0 && isMoving) {
-        currentSpeed = CONFIG.sprintSpeed; // Sprint override
-        p.stamina = Math.max(0, p.stamina - 1.5); // Drain
+        currentSpeed = CONFIG.sprintSpeed;
+        p.stamina = Math.max(0, p.stamina - 1.5); 
     } else {
-        p.stamina = Math.min(100, p.stamina + 0.5); // Regen
+        p.stamina = Math.min(100, p.stamina + 0.5); 
     }
 
     if (isMoving) {
-      const len = Math.hypot(input.dx, input.dy);
-      if (len > 0) {
+      // Fast approx normalization
+      const lenSq = input.dx*input.dx + input.dy*input.dy;
+      if (lenSq > 0) {
+        const len = Math.sqrt(lenSq); 
         p.x += (input.dx / len) * currentSpeed * (1 / TICK_RATE);
         p.y += (input.dy / len) * currentSpeed * (1 / TICK_RATE);
         p.idleTime = 0;
@@ -140,11 +137,11 @@ io.on("connection", (socket) => {
       p.idleTime += 1 / TICK_RATE;
     }
 
-    p.x = Math.max(20, Math.min(GAME_WIDTH - 20, p.x));
-    p.y = Math.max(20, Math.min(GAME_HEIGHT - 20, p.y));
+    // Fast clamping
+    if (p.x < 20) p.x = 20; else if (p.x > GAME_WIDTH - 20) p.x = GAME_WIDTH - 20;
+    if (p.y < 20) p.y = 20; else if (p.y > GAME_HEIGHT - 20) p.y = GAME_HEIGHT - 20;
 
     if (input.shoot && p.role === "hunter") {
-        // SLOT 1: GUN
         if (p.activeSlot === 1 && p.ammo > 0) {
             p.ammo--;
             const angle = Math.atan2(input.aimY - p.y, input.aimX - p.x);
@@ -155,24 +152,26 @@ io.on("connection", (socket) => {
             });
             gameState.events.push({ type: "sound", name: "shoot" });
         } 
-        // SLOT 2: MARKER (Forgiving Hitbox)
         else if (p.activeSlot === 2) {
-            const clickRadius = 60; // INCREASED FROM 30 to 60 for easier clicking
+            // OPTIMIZED HIT CHECK: Squared Distance (No Sqrt)
+            const clickRadiusSq = 3600; // 60 * 60
             let hitFound = false;
 
-            // Prioritize NPCs first
             for (let n of gameState.npcs) {
-                if (!n.dead && Math.hypot(n.x - input.aimX, n.y - input.aimY) < clickRadius) {
+                const dx = n.x - input.aimX;
+                const dy = n.y - input.aimY;
+                if (!n.dead && (dx*dx + dy*dy) < clickRadiusSq) {
                     n.mark = (n.mark + 1) % 4; 
                     hitFound = true;
                     break; 
                 }
             }
-            // Check Players
             if (!hitFound) {
                 for (let pid in gameState.players) {
                     const target = gameState.players[pid];
-                    if (target.role === "hider" && !target.dead && Math.hypot(target.x - input.aimX, target.y - input.aimY) < clickRadius) {
+                    const dx = target.x - input.aimX;
+                    const dy = target.y - input.aimY;
+                    if (target.role === "hider" && !target.dead && (dx*dx + dy*dy) < clickRadiusSq) {
                         target.mark = (target.mark + 1) % 4;
                         break;
                     }
@@ -207,77 +206,104 @@ setInterval(() => {
     gameState.timer -= dt;
 
     // NPC Logic
-    gameState.npcs.forEach((n) => {
-      if (n.dead) return;
+    const npcCount = gameState.npcs.length;
+    for(let i=0; i<npcCount; i++) {
+        const n = gameState.npcs[i];
+        if (n.dead) continue;
 
-      // Brain: Change direction OR Sprint status
-      if (n.moveTimer <= 0) {
-        n.moveTimer = Math.random() * 2.0 + 0.5; 
-        
-        // 20% chance to stop, 80% move
-        if (Math.random() < 0.2) { 
-            n.moveX = 0; n.moveY = 0; 
-            n.sprinting = false;
-        } else { 
-            n.moveX = Math.floor(Math.random() * 3) - 1; 
-            n.moveY = Math.floor(Math.random() * 3) - 1;
-            // 30% chance to sprint when moving
-            n.sprinting = Math.random() < 0.3;
+        if (n.moveTimer <= 0) {
+            n.moveTimer = Math.random() * 2.0 + 0.5; 
+            if (Math.random() < 0.2) { 
+                n.moveX = 0; n.moveY = 0; n.sprinting = false;
+            } else { 
+                n.moveX = Math.floor(Math.random() * 3) - 1; 
+                n.moveY = Math.floor(Math.random() * 3) - 1;
+                n.sprinting = Math.random() < 0.3;
+            }
         }
-      }
+        n.moveTimer -= dt;
 
-      n.moveTimer -= dt;
+        if (n.moveX !== 0 || n.moveY !== 0) {
+            // Avoid Sqrt for movement normalization if just diagonal/cardinal
+            // Precomputed: diagonal length is ~1.414
+            let dMult = 1;
+            if (n.moveX !== 0 && n.moveY !== 0) dMult = 0.7071;
 
-      if (n.moveX !== 0 || n.moveY !== 0) {
-        const len = Math.hypot(n.moveX, n.moveY);
-        if (len > 0) {
-            // Determine NPC Speed
             const speed = n.sprinting ? CONFIG.sprintSpeed : CONFIG.npcSpeed;
-            n.x += (n.moveX / len) * speed * dt;
-            n.y += (n.moveY / len) * speed * dt;
+            n.x += n.moveX * speed * dMult * dt;
+            n.y += n.moveY * speed * dMult * dt;
         }
-      }
-      
-      // Bounds
-      if (n.x < 20) { n.x = 20; n.moveX = 1; }
-      if (n.x > GAME_WIDTH - 20) { n.x = GAME_WIDTH - 20; n.moveX = -1; }
-      if (n.y < 20) { n.y = 20; n.moveY = 1; }
-      if (n.y > GAME_HEIGHT - 20) { n.y = GAME_HEIGHT - 20; n.moveY = -1; }
-    });
+        
+        // Bounds
+        if (n.x < 20) { n.x = 20; n.moveX = 1; }
+        else if (n.x > GAME_WIDTH - 20) { n.x = GAME_WIDTH - 20; n.moveX = -1; }
+        if (n.y < 20) { n.y = 20; n.moveY = 1; }
+        else if (n.y > GAME_HEIGHT - 20) { n.y = GAME_HEIGHT - 20; n.moveY = -1; }
+    }
 
-    // Bullets
-    gameState.bullets.forEach((b) => {
-      b.x += b.vx * dt;
-      b.y += b.vy * dt;
-      b.life -= dt;
-      if (b.life > 0) {
-        gameState.npcs.forEach((n) => {
-          if (!n.dead && Math.hypot(n.x - b.x, n.y - b.y) < 25) {
-            n.dead = true; b.life = 0; 
-            gameState.events.push({ type: "kill", x: n.x, y: n.y, color: n.color });
-            gameState.events.push({ type: "msg", text: "CIVILIAN CASUALTY" });
-            gameState.events.push({ type: "shake", amount: 10 });
-          }
-        });
-        Object.values(gameState.players).forEach((p) => {
-          if (p.role === "hider" && !p.dead && Math.hypot(p.x - b.x, p.y - b.y) < 25) {
-            p.dead = true; b.life = 0;
-            gameState.events.push({ type: "kill", x: p.x, y: p.y, color: p.color });
-            gameState.events.push({ type: "msg", text: "TARGET ELIMINATED" });
-            gameState.events.push({ type: "shake", amount: 20 });
-          }
-        });
-      }
-    });
-    gameState.bullets = gameState.bullets.filter((b) => b.life > 0);
+    // Bullet Collisions - Optimized
+    const hitRadiusSq = 625; // 25 * 25
+    for(let i = gameState.bullets.length - 1; i >= 0; i--) {
+        const b = gameState.bullets[i];
+        b.x += b.vx * dt;
+        b.y += b.vy * dt;
+        b.life -= dt;
+
+        if (b.life <= 0) {
+            gameState.bullets.splice(i, 1);
+            continue;
+        }
+
+        // Check NPCs
+        for(let n of gameState.npcs) {
+            if (n.dead) continue;
+            const dx = n.x - b.x;
+            const dy = n.y - b.y;
+            if ((dx*dx + dy*dy) < hitRadiusSq) {
+                n.dead = true; 
+                b.life = 0; 
+                gameState.events.push({ type: "kill", x: n.x, y: n.y, color: n.color });
+                gameState.events.push({ type: "msg", text: "CIVILIAN CASUALTY" });
+                gameState.events.push({ type: "shake", amount: 10 });
+                break; // Bullet hits one thing
+            }
+        }
+        
+        if (b.life <= 0) {
+            gameState.bullets.splice(i, 1);
+            continue;
+        }
+
+        // Check Players
+        const pIds = Object.keys(gameState.players);
+        for(let pid of pIds) {
+            const p = gameState.players[pid];
+            if (p.role === "hider" && !p.dead) {
+                const dx = p.x - b.x;
+                const dy = p.y - b.y;
+                if ((dx*dx + dy*dy) < hitRadiusSq) {
+                    p.dead = true;
+                    b.life = 0;
+                    gameState.events.push({ type: "kill", x: p.x, y: p.y, color: p.color });
+                    gameState.events.push({ type: "msg", text: "TARGET ELIMINATED" });
+                    gameState.events.push({ type: "shake", amount: 20 });
+                    break;
+                }
+            }
+        }
+
+        if (b.life <= 0) gameState.bullets.splice(i, 1);
+    }
 
     // Win Logic
-    const livingHiders = Object.values(gameState.players).filter(p => p.role === "hider" && !p.dead);
-    const hunter = Object.values(gameState.players).find(p => p.role === "hunter");
+    const allPlayers = Object.values(gameState.players);
+    const livingHiders = allPlayers.filter(p => p.role === "hider" && !p.dead);
+    const hunter = allPlayers.find(p => p.role === "hunter");
+    
     let gameOverReason = null;
     let hunterWon = false;
 
-    if (livingHiders.length === 0 && Object.values(gameState.players).some(p => p.role === "hider")) {
+    if (livingHiders.length === 0 && allPlayers.some(p => p.role === "hider")) {
         gameOverReason = "ALL TARGETS ELIMINATED"; hunterWon = true;
     } else if (gameState.timer <= 0) {
         gameOverReason = "TIME EXPIRED"; hunterWon = false;
@@ -291,10 +317,18 @@ setInterval(() => {
     }
   }
 
+  // DATA COMPRESSION: Round integers before sending
   io.emit("tick", {
-    players: gameState.players,
-    npcs: gameState.npcs.map(n => ({x:Math.round(n.x), y:Math.round(n.y), dead:n.dead, color:n.color, mark:n.mark})), 
-    bullets: gameState.bullets,
+    players: gameState.players, // Sending full object ok for players (low count)
+    // Strip heavy decimals from NPCs
+    npcs: gameState.npcs.map(n => ({
+        x: (n.x | 0), // Bitwise floor (faster)
+        y: (n.y | 0), 
+        dead: n.dead, 
+        color: n.color, 
+        mark: n.mark
+    })), 
+    bullets: gameState.bullets.map(b => ({x: (b.x|0), y: (b.y|0), vx: b.vx, vy: b.vy})),
     timer: Math.round(gameState.timer),
     events: gameState.events 
   });
