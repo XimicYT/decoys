@@ -21,8 +21,8 @@ const CONFIG = {
   npcsPerPlayer: 10,
   npcSpeed: 170,
   sprintSpeed: 300,
-  spectatorSpeed: 600, // Super fast for ghosts
-  hunterAmmo: 3,
+  spectatorSpeed: 600, // Fast movement for dead players
+  fireRate: 0.6,       // Seconds between shots
   gameDuration: 120,
 };
 
@@ -69,33 +69,42 @@ function resetGame() {
     hunterId = playerIds[Math.floor(Math.random() * playerIds.length)];
   }
 
-  // 3. Position Players (Safe Spawning)
+  // 3. Dynamic Ammo Calculation
+  // Base allowed mistakes (2) + 1 per Hider.
+  const hiderCount = Math.max(1, playerIds.length - 1);
+  const hunterLives = 2 + hiderCount;
+
+  // 4. Setup Players
   playerIds.forEach((id) => {
     const p = gameState.players[id];
-    p.dead = false; p.ammo = 0; p.idleTime = 0; p.stamina = 100;
+    p.dead = false; 
+    p.ammo = 0; 
+    p.shootTimer = 0; // Cooldown tracker
+    p.idleTime = 0; 
+    p.stamina = 100;
     p.role = (id === hunterId) ? "hunter" : "hider";
     p.color = "#00ffcc"; 
     p.mark = 0;
-    if (p.role === "hunter") p.ammo = CONFIG.hunterAmmo;
 
-    // Position Logic
+    if (p.role === "hunter") {
+        p.ammo = hunterLives;
+    }
+
+    // Safe Spawning Logic
     let pos = randomPos();
-    
-    // If Hider, ensure not too close to Hunter
     if (p.role === "hider" && hunterId) {
         const hunterP = gameState.players[hunterId];
         let attempts = 0;
         let dist = 0;
-        // Keep retrying until distance > 800 or 10 attempts
+        // Ensure Hider is at least 800px away from Hunter
         do {
             pos = randomPos();
             const dx = pos.x - hunterP.x;
             const dy = pos.y - hunterP.y;
             dist = Math.sqrt(dx*dx + dy*dy);
             attempts++;
-        } while (dist < 800 && attempts < 10);
+        } while (dist < 800 && attempts < 15);
     }
-
     p.x = pos.x; p.y = pos.y;
   });
 }
@@ -103,9 +112,10 @@ function resetGame() {
 io.on("connection", (socket) => {
   console.log("Connect:", socket.id);
   
-  // Send init immediately
+  // Send init immediately so client can render map/menu
   socket.emit("init", { id: socket.id, width: GAME_WIDTH, height: GAME_HEIGHT });
 
+  // Player joins only after clicking button
   socket.on("joinGame", (data) => {
     if (gameState.players[socket.id]) return;
 
@@ -116,20 +126,20 @@ io.on("connection", (socket) => {
     gameState.players[socket.id] = {
       id: socket.id,
       x: GAME_WIDTH / 2, y: GAME_HEIGHT / 2,
-      role: "hider", color: "#ffffff", dead: false,
+      role: "hider", 
+      color: "#ffffff", 
+      dead: false,
       name: cleanName,
       host: Object.keys(gameState.players).length === 0, 
-      activeSlot: 1, stamina: 100
+      activeSlot: 1, 
+      stamina: 100,
+      shootTimer: 0
     };
   });
 
   socket.on("input", (input) => {
     const p = gameState.players[socket.id];
-    // If player doesn't exist, ignore
-    if (!p) return;
-    
-    // If Game not playing, ignore
-    if (gameState.status !== "PLAYING") return;
+    if (!p || gameState.status !== "PLAYING") return;
 
     if (input.slot) p.activeSlot = input.slot;
 
@@ -167,22 +177,28 @@ io.on("connection", (socket) => {
     p.y = Math.max(20, Math.min(GAME_HEIGHT - 20, p.y));
 
     // --- SHOOTING (Alive Only) ---
-    if (p.dead) return; // Ghosts cannot shoot
+    if (p.dead) return; 
 
     if (input.shoot && p.role === "hunter") {
-        if (p.activeSlot === 1 && p.ammo > 0) {
-            p.ammo--;
-            const angle = Math.atan2(input.aimY - p.y, input.aimX - p.x);
-            gameState.bullets.push({
-                x: p.x, y: p.y,
-                vx: Math.cos(angle) * 1000, vy: Math.sin(angle) * 1000,
-                life: 1.5, owner: p.id,
-            });
-            gameState.events.push({ type: "sound", name: "shoot" });
+        if (p.activeSlot === 1) {
+            // Rate Limit Check
+            if (p.shootTimer <= 0) {
+                // We do NOT decrement ammo here. 
+                p.shootTimer = CONFIG.fireRate; // Reset cooldown
+
+                const angle = Math.atan2(input.aimY - p.y, input.aimX - p.x);
+                gameState.bullets.push({
+                    x: p.x, y: p.y,
+                    vx: Math.cos(angle) * 1000, vy: Math.sin(angle) * 1000,
+                    life: 1.5, owner: p.id,
+                });
+                gameState.events.push({ type: "sound", name: "shoot" });
+            }
         } 
         else if (p.activeSlot === 2) {
             const clickRadiusSq = 3600; 
             let hitFound = false;
+            // Check NPCs
             for (let n of gameState.npcs) {
                 const dx = n.x - input.aimX;
                 const dy = n.y - input.aimY;
@@ -191,6 +207,7 @@ io.on("connection", (socket) => {
                     hitFound = true; break; 
                 }
             }
+            // Check Players
             if (!hitFound) {
                 for (let pid in gameState.players) {
                     const target = gameState.players[pid];
@@ -232,6 +249,13 @@ setInterval(() => {
   if (gameState.status === "PLAYING") {
     const dt = 1 / TICK_RATE;
     gameState.timer -= dt;
+
+    // Cooldown Logic
+    for (let pid in gameState.players) {
+        if (gameState.players[pid].shootTimer > 0) {
+            gameState.players[pid].shootTimer -= dt;
+        }
+    }
 
     // NPC Logic
     for(let n of gameState.npcs) {
@@ -278,8 +302,15 @@ setInterval(() => {
             const dx = n.x - b.x, dy = n.y - b.y;
             if ((dx*dx + dy*dy) < hitRadiusSq) {
                 n.dead = true; hit = true;
+                
+                // PENALTY: Killing NPC reduces lives
+                const hunter = gameState.players[b.owner];
+                if (hunter) {
+                    hunter.ammo--;
+                    gameState.events.push({ type: "msg", text: `CIVILIAN KILLED! (${hunter.ammo} LEFT)` });
+                }
+
                 gameState.events.push({ type: "kill", x: n.x, y: n.y, color: n.color });
-                gameState.events.push({ type: "msg", text: "CIVILIAN CASUALTY" });
                 gameState.events.push({ type: "shake", amount: 10 });
                 break; 
             }
@@ -289,11 +320,11 @@ setInterval(() => {
         // Check Player Hits
         for(let pid in gameState.players) {
             const p = gameState.players[pid];
-            // Only kill Living Hiders
             if (p.role === "hider" && !p.dead) {
                 const dx = p.x - b.x, dy = p.y - b.y;
                 if ((dx*dx + dy*dy) < hitRadiusSq) {
                     p.dead = true; hit = true;
+                    // NO PENALTY for killing players
                     gameState.events.push({ type: "kill", x: p.x, y: p.y, color: p.color });
                     gameState.events.push({ type: "msg", text: "TARGET ELIMINATED" });
                     gameState.events.push({ type: "shake", amount: 20 });
@@ -314,8 +345,8 @@ setInterval(() => {
         gameOverReason = "ALL TARGETS ELIMINATED"; hunterWon = true;
     } else if (gameState.timer <= 0) {
         gameOverReason = "TIME EXPIRED"; hunterWon = false;
-    } else if (hunter && hunter.ammo <= 0 && gameState.bullets.length === 0) {
-        gameOverReason = "OUT OF AMMO"; hunterWon = false;
+    } else if (hunter && hunter.ammo <= 0) {
+        gameOverReason = "TOO MANY CIVILIAN CASUALTIES"; hunterWon = false;
     }
 
     if (gameOverReason) {
