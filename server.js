@@ -9,11 +9,10 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
-  // Optimize socket transport
-  transports: ["websocket", "polling"], 
+  transports: ["websocket", "polling"],
 });
 
-// --- CONSTANTS & CONFIG ---
+// --- CONFIG ---
 const GAME_WIDTH = 2000;
 const GAME_HEIGHT = 2000;
 const TICK_RATE = 30; 
@@ -35,7 +34,7 @@ let gameState = {
   events: [], 
 };
 
-// Helper: integers are cheaper to serialize
+// Fast integer random
 const randomPos = () => ({
   x: Math.floor(Math.random() * (GAME_WIDTH - 100) + 50),
   y: Math.floor(Math.random() * (GAME_HEIGHT - 100) + 50),
@@ -55,13 +54,9 @@ function resetGame() {
     const pos = randomPos();
     gameState.npcs.push({
       id: `npc_${i}`,
-      x: pos.x,
-      y: pos.y,
-      moveX: 0, moveY: 0, moveTimer: 0, 
-      sprinting: false,
-      color: "#00ffcc",
-      mark: 0, 
-      dead: false,
+      x: pos.x, y: pos.y,
+      moveX: 0, moveY: 0, moveTimer: 0, sprinting: false,
+      color: "#00ffcc", mark: 0, dead: false,
     });
   }
 
@@ -69,15 +64,9 @@ function resetGame() {
   playerIds.forEach((id) => {
     const p = gameState.players[id];
     const pos = randomPos();
-    p.x = pos.x;
-    p.y = pos.y;
-    p.dead = false;
-    p.ammo = 0;
-    p.idleTime = 0;
-    p.stamina = 100;
-    p.role = "hider";
-    p.color = "#00ffcc"; 
-    p.mark = 0;
+    p.x = pos.x; p.y = pos.y;
+    p.dead = false; p.ammo = 0; p.idleTime = 0; p.stamina = 100;
+    p.role = "hider"; p.color = "#00ffcc"; p.mark = 0;
   });
 
   if (playerIds.length > 0) {
@@ -89,19 +78,15 @@ function resetGame() {
 }
 
 io.on("connection", (socket) => {
-  console.log("Player connected:", socket.id);
+  console.log("Connect:", socket.id);
 
   gameState.players[socket.id] = {
     id: socket.id,
-    x: GAME_WIDTH / 2,
-    y: GAME_HEIGHT / 2,
-    role: "hider",
-    color: "#ffffff",
-    dead: false,
+    x: GAME_WIDTH / 2, y: GAME_HEIGHT / 2,
+    role: "hider", color: "#ffffff", dead: false,
     name: "Agent " + socket.id.substr(0, 4),
     host: Object.keys(gameState.players).length === 0, 
-    activeSlot: 1,
-    stamina: 100
+    activeSlot: 1, stamina: 100
   };
 
   socket.emit("init", { id: socket.id, width: GAME_WIDTH, height: GAME_HEIGHT });
@@ -112,34 +97,36 @@ io.on("connection", (socket) => {
 
     if (input.slot) p.activeSlot = input.slot;
 
-    // STAMINA & SPEED
-    let currentSpeed = CONFIG.npcSpeed; 
-    if (p.role === "hunter") currentSpeed *= 1.1;
+    // --- MOVEMENT LOGIC (Must match Client exactly) ---
+    let speed = CONFIG.npcSpeed; 
+    if (p.role === "hunter") speed *= 1.1;
 
-    let isMoving = input.dx !== 0 || input.dy !== 0;
-    if (input.sprint && p.stamina > 0 && isMoving) {
-        currentSpeed = CONFIG.sprintSpeed;
+    let isSprinting = input.sprint && p.stamina > 0 && (input.dx !== 0 || input.dy !== 0);
+    
+    // Drain/Regen Stamina
+    if (isSprinting) {
+        speed = CONFIG.sprintSpeed;
         p.stamina = Math.max(0, p.stamina - 1.5); 
     } else {
         p.stamina = Math.min(100, p.stamina + 0.5); 
     }
 
-    if (isMoving) {
-      // Fast approx normalization
+    if (input.dx !== 0 || input.dy !== 0) {
+      // Normalize vector
       const lenSq = input.dx*input.dx + input.dy*input.dy;
-      if (lenSq > 0) {
-        const len = Math.sqrt(lenSq); 
-        p.x += (input.dx / len) * currentSpeed * (1 / TICK_RATE);
-        p.y += (input.dy / len) * currentSpeed * (1 / TICK_RATE);
-        p.idleTime = 0;
-      }
+      const len = Math.sqrt(lenSq); 
+      // Move
+      p.x += (input.dx / len) * speed * (1 / TICK_RATE);
+      p.y += (input.dy / len) * speed * (1 / TICK_RATE);
+      p.idleTime = 0;
     } else {
       p.idleTime += 1 / TICK_RATE;
     }
 
-    // Fast clamping
-    if (p.x < 20) p.x = 20; else if (p.x > GAME_WIDTH - 20) p.x = GAME_WIDTH - 20;
-    if (p.y < 20) p.y = 20; else if (p.y > GAME_HEIGHT - 20) p.y = GAME_HEIGHT - 20;
+    // Clamp Bounds
+    p.x = Math.max(20, Math.min(GAME_WIDTH - 20, p.x));
+    p.y = Math.max(20, Math.min(GAME_HEIGHT - 20, p.y));
+    // --------------------------------------------------
 
     if (input.shoot && p.role === "hunter") {
         if (p.activeSlot === 1 && p.ammo > 0) {
@@ -153,8 +140,7 @@ io.on("connection", (socket) => {
             gameState.events.push({ type: "sound", name: "shoot" });
         } 
         else if (p.activeSlot === 2) {
-            // OPTIMIZED HIT CHECK: Squared Distance (No Sqrt)
-            const clickRadiusSq = 3600; // 60 * 60
+            const clickRadiusSq = 3600; 
             let hitFound = false;
 
             for (let n of gameState.npcs) {
@@ -162,8 +148,7 @@ io.on("connection", (socket) => {
                 const dy = n.y - input.aimY;
                 if (!n.dead && (dx*dx + dy*dy) < clickRadiusSq) {
                     n.mark = (n.mark + 1) % 4; 
-                    hitFound = true;
-                    break; 
+                    hitFound = true; break; 
                 }
             }
             if (!hitFound) {
@@ -172,8 +157,7 @@ io.on("connection", (socket) => {
                     const dx = target.x - input.aimX;
                     const dy = target.y - input.aimY;
                     if (target.role === "hider" && !target.dead && (dx*dx + dy*dy) < clickRadiusSq) {
-                        target.mark = (target.mark + 1) % 4;
-                        break;
+                        target.mark = (target.mark + 1) % 4; break;
                     }
                 }
             }
@@ -224,66 +208,51 @@ setInterval(() => {
         n.moveTimer -= dt;
 
         if (n.moveX !== 0 || n.moveY !== 0) {
-            // Avoid Sqrt for movement normalization if just diagonal/cardinal
-            // Precomputed: diagonal length is ~1.414
             let dMult = 1;
             if (n.moveX !== 0 && n.moveY !== 0) dMult = 0.7071;
-
             const speed = n.sprinting ? CONFIG.sprintSpeed : CONFIG.npcSpeed;
             n.x += n.moveX * speed * dMult * dt;
             n.y += n.moveY * speed * dMult * dt;
         }
         
         // Bounds
-        if (n.x < 20) { n.x = 20; n.moveX = 1; }
-        else if (n.x > GAME_WIDTH - 20) { n.x = GAME_WIDTH - 20; n.moveX = -1; }
-        if (n.y < 20) { n.y = 20; n.moveY = 1; }
-        else if (n.y > GAME_HEIGHT - 20) { n.y = GAME_HEIGHT - 20; n.moveY = -1; }
+        if (n.x < 20) { n.x = 20; n.moveX = 1; } else if (n.x > GAME_WIDTH - 20) { n.x = GAME_WIDTH - 20; n.moveX = -1; }
+        if (n.y < 20) { n.y = 20; n.moveY = 1; } else if (n.y > GAME_HEIGHT - 20) { n.y = GAME_HEIGHT - 20; n.moveY = -1; }
     }
 
-    // Bullet Collisions - Optimized
-    const hitRadiusSq = 625; // 25 * 25
+    // Bullets
+    const hitRadiusSq = 625; 
     for(let i = gameState.bullets.length - 1; i >= 0; i--) {
         const b = gameState.bullets[i];
         b.x += b.vx * dt;
         b.y += b.vy * dt;
         b.life -= dt;
 
-        if (b.life <= 0) {
-            gameState.bullets.splice(i, 1);
-            continue;
-        }
+        if (b.life <= 0) { gameState.bullets.splice(i, 1); continue; }
 
+        let hit = false;
         // Check NPCs
         for(let n of gameState.npcs) {
             if (n.dead) continue;
-            const dx = n.x - b.x;
-            const dy = n.y - b.y;
+            const dx = n.x - b.x; const dy = n.y - b.y;
             if ((dx*dx + dy*dy) < hitRadiusSq) {
-                n.dead = true; 
-                b.life = 0; 
+                n.dead = true; hit = true;
                 gameState.events.push({ type: "kill", x: n.x, y: n.y, color: n.color });
                 gameState.events.push({ type: "msg", text: "CIVILIAN CASUALTY" });
                 gameState.events.push({ type: "shake", amount: 10 });
-                break; // Bullet hits one thing
+                break; 
             }
         }
-        
-        if (b.life <= 0) {
-            gameState.bullets.splice(i, 1);
-            continue;
-        }
+        if (hit) { b.life = 0; gameState.bullets.splice(i, 1); continue; }
 
         // Check Players
         const pIds = Object.keys(gameState.players);
         for(let pid of pIds) {
             const p = gameState.players[pid];
             if (p.role === "hider" && !p.dead) {
-                const dx = p.x - b.x;
-                const dy = p.y - b.y;
+                const dx = p.x - b.x; const dy = p.y - b.y;
                 if ((dx*dx + dy*dy) < hitRadiusSq) {
-                    p.dead = true;
-                    b.life = 0;
+                    p.dead = true; hit = true;
                     gameState.events.push({ type: "kill", x: p.x, y: p.y, color: p.color });
                     gameState.events.push({ type: "msg", text: "TARGET ELIMINATED" });
                     gameState.events.push({ type: "shake", amount: 20 });
@@ -291,17 +260,15 @@ setInterval(() => {
                 }
             }
         }
-
-        if (b.life <= 0) gameState.bullets.splice(i, 1);
+        if (hit) { b.life = 0; gameState.bullets.splice(i, 1); }
+        else if (b.life <= 0) gameState.bullets.splice(i, 1);
     }
 
     // Win Logic
     const allPlayers = Object.values(gameState.players);
     const livingHiders = allPlayers.filter(p => p.role === "hider" && !p.dead);
     const hunter = allPlayers.find(p => p.role === "hunter");
-    
-    let gameOverReason = null;
-    let hunterWon = false;
+    let gameOverReason = null; let hunterWon = false;
 
     if (livingHiders.length === 0 && allPlayers.some(p => p.role === "hider")) {
         gameOverReason = "ALL TARGETS ELIMINATED"; hunterWon = true;
@@ -317,18 +284,11 @@ setInterval(() => {
     }
   }
 
-  // DATA COMPRESSION: Round integers before sending
+  // Data Packet
   io.emit("tick", {
-    players: gameState.players, // Sending full object ok for players (low count)
-    // Strip heavy decimals from NPCs
-    npcs: gameState.npcs.map(n => ({
-        x: (n.x | 0), // Bitwise floor (faster)
-        y: (n.y | 0), 
-        dead: n.dead, 
-        color: n.color, 
-        mark: n.mark
-    })), 
-    bullets: gameState.bullets.map(b => ({x: (b.x|0), y: (b.y|0), vx: b.vx, vy: b.vy})),
+    players: gameState.players, 
+    npcs: gameState.npcs.map(n => ({ x: (n.x|0), y: (n.y|0), dead: n.dead, color: n.color, mark: n.mark })), 
+    bullets: gameState.bullets.map(b => ({ x: (b.x|0), y: (b.y|0), vx: b.vx, vy: b.vy })),
     timer: Math.round(gameState.timer),
     events: gameState.events 
   });
@@ -336,6 +296,4 @@ setInterval(() => {
 }, 1000 / TICK_RATE);
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+server.listen(PORT, () => { console.log(`Server running on port ${PORT}`); });
