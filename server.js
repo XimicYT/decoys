@@ -13,14 +13,14 @@ const io = new Server(server, {
 });
 
 // --- CONSTANTS ---
-const GAME_WIDTH = 2000;
-const GAME_HEIGHT = 2000;
+const GAME_WIDTH = 1200;
+const GAME_HEIGHT = 1200;
 const TICK_RATE = 30; 
 const CONFIG = {
-  baseNPCs: 30,
-  npcsPerPlayer: 10,
+  baseNPCs: 25,
+  npcsPerPlayer: 6,
   npcSpeed: 170,
-  sprintSpeed: 300,
+  sprintSpeed: 280,
   spectatorSpeed: 600, // Fast movement for dead players
   fireRate: 0.6,       // Seconds between shots
   gameDuration: 120,
@@ -103,7 +103,7 @@ function resetGame() {
             const dy = pos.y - hunterP.y;
             dist = Math.sqrt(dx*dx + dy*dy);
             attempts++;
-        } while (dist < 800 && attempts < 15);
+        } while (dist < 500 && attempts < 15);
     }
     p.x = pos.x; p.y = pos.y;
   });
