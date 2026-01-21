@@ -19,10 +19,9 @@ const GAME_WIDTH = 2000;
 const GAME_HEIGHT = 2000;
 const TICK_RATE = 30; 
 const CONFIG = {
-  // NPCs will now scale dynamically
-  baseNPCs: 20,       // Minimum crowd
-  npcsPerPlayer: 15,  // Add this many NPCs per human to keep density balanced
-  npcSpeed: 180,      // Match player speed exactly for confusion
+  baseNPCs: 20,
+  npcsPerPlayer: 15,
+  npcSpeed: 180,
   playerSpeed: 180,
   hunterAmmo: 3,
   gameDuration: 120,
@@ -51,28 +50,23 @@ function resetGame() {
   gameState.status = "PLAYING";
 
   const playerCount = Object.keys(gameState.players).length;
-  
-  // DYNAMIC DECOY COUNT
-  // Ensures it's not "too easy" (too few) or "impossible" (too many)
   const totalNPCs = CONFIG.baseNPCs + (playerCount * CONFIG.npcsPerPlayer);
 
-  // Generate NPCs with "Keyboard" brains
   for (let i = 0; i < totalNPCs; i++) {
     const pos = randomPos();
     gameState.npcs.push({
       id: `npc_${i}`,
       x: pos.x,
       y: pos.y,
-      // AI "Input" State
-      moveX: 0, // -1, 0, or 1 (Like A/D keys)
-      moveY: 0, // -1, 0, or 1 (Like W/S keys)
-      moveTimer: 0, // How long to hold this key press
+      moveX: 0, 
+      moveY: 0, 
+      moveTimer: 0, 
       color: "#00ffcc",
+      mark: 0, // 0: None, 1: ?, 2: Check, 3: !
       dead: false,
     });
   }
 
-  // Reset Players
   const playerIds = Object.keys(gameState.players);
   playerIds.forEach((id) => {
     const p = gameState.players[id];
@@ -84,9 +78,9 @@ function resetGame() {
     p.idleTime = 0;
     p.role = "hider";
     p.color = "#00ffcc"; 
+    p.mark = 0; // Reset marks
   });
 
-  // Assign Hunter
   if (playerIds.length > 0) {
     const hunterId = playerIds[Math.floor(Math.random() * playerIds.length)];
     gameState.players[hunterId].role = "hunter";
@@ -107,6 +101,7 @@ io.on("connection", (socket) => {
     dead: false,
     name: "Agent " + socket.id.substr(0, 4),
     host: Object.keys(gameState.players).length === 0, 
+    activeSlot: 1 // Default to gun
   };
 
   socket.emit("init", { id: socket.id, width: GAME_WIDTH, height: GAME_HEIGHT });
@@ -115,10 +110,12 @@ io.on("connection", (socket) => {
     const p = gameState.players[socket.id];
     if (!p || p.dead || gameState.status !== "PLAYING") return;
 
-    // Movement (Standardized to match NPC logic)
+    // Update Slot Selection
+    if (input.slot) p.activeSlot = input.slot;
+
+    // Movement 
     if (input.dx !== 0 || input.dy !== 0) {
       const len = Math.hypot(input.dx, input.dy);
-      // Normalize speed so diagonals aren't faster
       if (len > 0) {
         const speed = p.role === "hunter" ? CONFIG.playerSpeed * 1.1 : CONFIG.playerSpeed;
         p.x += (input.dx / len) * speed * (1 / TICK_RATE);
@@ -129,33 +126,66 @@ io.on("connection", (socket) => {
       p.idleTime += 1 / TICK_RATE;
     }
 
-    // Boundary Checks
     p.x = Math.max(20, Math.min(GAME_WIDTH - 20, p.x));
     p.y = Math.max(20, Math.min(GAME_HEIGHT - 20, p.y));
 
-    // Shooting
-    if (input.shoot && p.role === "hunter" && p.ammo > 0) {
-      p.ammo--;
-      const angle = Math.atan2(input.aimY - p.y, input.aimX - p.x);
-      gameState.bullets.push({
-        x: p.x,
-        y: p.y,
-        vx: Math.cos(angle) * 1000,
-        vy: Math.sin(angle) * 1000,
-        life: 1.5, 
-        owner: p.id,
-      });
-      gameState.events.push({ type: "sound", name: "shoot" });
+    // ACTION HANDLING (Shoot vs Mark)
+    if (input.shoot && p.role === "hunter") {
+        
+        // SLOT 1: GUN
+        if (p.activeSlot === 1) {
+            if (p.ammo > 0) {
+                p.ammo--;
+                const angle = Math.atan2(input.aimY - p.y, input.aimX - p.x);
+                gameState.bullets.push({
+                    x: p.x,
+                    y: p.y,
+                    vx: Math.cos(angle) * 1000,
+                    vy: Math.sin(angle) * 1000,
+                    life: 1.5, 
+                    owner: p.id,
+                });
+                gameState.events.push({ type: "sound", name: "shoot" });
+            }
+        } 
+        
+        // SLOT 2: MARKER
+        else if (p.activeSlot === 2) {
+            // Find entity under mouse cursor (aimX, aimY)
+            const clickRadius = 30;
+            let hitFound = false;
+
+            // Check NPCs
+            for (let n of gameState.npcs) {
+                if (!n.dead && Math.hypot(n.x - input.aimX, n.y - input.aimY) < clickRadius) {
+                    n.mark = (n.mark + 1) % 4; // Cycle 0 -> 1 -> 2 -> 3 -> 0
+                    hitFound = true;
+                    break; // Only mark one at a time
+                }
+            }
+
+            // Check Players (if NPC wasn't hit)
+            if (!hitFound) {
+                for (let pid in gameState.players) {
+                    const target = gameState.players[pid];
+                    if (target.role === "hider" && !target.dead && Math.hypot(target.x - input.aimX, target.y - input.aimY) < clickRadius) {
+                        target.mark = (target.mark + 1) % 4;
+                        // Optional: Send specific alert event if needed, but state sync handles visuals
+                        if (target.mark > 0) {
+                            // We could push an event, but the visual update is enough
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
   });
 
   socket.on("startGame", () => {
     const p = gameState.players[socket.id];
-    // REQ: Cannot start without 2nd player
     if (p && p.host && gameState.status !== "PLAYING") {
-      if (Object.keys(gameState.players).length < 2) {
-        return; // Silent fail or handle in UI
-      }
+      if (Object.keys(gameState.players).length < 2) return;
       resetGame();
       io.emit("gameStart");
     }
@@ -166,7 +196,6 @@ io.on("connection", (socket) => {
     if (Object.keys(gameState.players).length > 0) {
         gameState.players[Object.keys(gameState.players)[0]].host = true;
     }
-    // If less than 2 players remain, end game
     if (gameState.status === "PLAYING" && Object.keys(gameState.players).length < 2) {
       gameState.status = "ENDED";
       io.emit("gameOver", { reason: "NOT ENOUGH PLAYERS", hunterWon: false });
@@ -179,54 +208,35 @@ setInterval(() => {
     const dt = 1 / TICK_RATE;
     gameState.timer -= dt;
 
-    // --- NEW NPC AI (WASD SIMULATION) ---
+    // NPC Logic
     gameState.npcs.forEach((n) => {
       if (n.dead) return;
-
-      // 1. Brain Decision: Change keys?
       if (n.moveTimer <= 0) {
-        // Pick new duration for this "key press"
         n.moveTimer = Math.random() * 2.0 + 0.5; 
-        
-        // Pick new direction (Discrete 8-way movement)
-        // 20% chance to stand still (camp)
-        if (Math.random() < 0.2) {
-            n.moveX = 0; 
-            n.moveY = 0;
-        } else {
-            // -1, 0, or 1
-            n.moveX = Math.floor(Math.random() * 3) - 1; 
-            n.moveY = Math.floor(Math.random() * 3) - 1;
-        }
+        if (Math.random() < 0.2) { n.moveX = 0; n.moveY = 0; } 
+        else { n.moveX = Math.floor(Math.random() * 3) - 1; n.moveY = Math.floor(Math.random() * 3) - 1; }
       }
-
       n.moveTimer -= dt;
-
-      // 2. Physics Movement
       if (n.moveX !== 0 || n.moveY !== 0) {
-        // Normalize exactly like player code
         const len = Math.hypot(n.moveX, n.moveY);
         if (len > 0) {
             n.x += (n.moveX / len) * CONFIG.npcSpeed * dt;
             n.y += (n.moveY / len) * CONFIG.npcSpeed * dt;
         }
       }
-
-      // 3. Bounce off walls (Simulate player correcting course)
       if (n.x < 20) { n.x = 20; n.moveX = 1; }
       if (n.x > GAME_WIDTH - 20) { n.x = GAME_WIDTH - 20; n.moveX = -1; }
       if (n.y < 20) { n.y = 20; n.moveY = 1; }
       if (n.y > GAME_HEIGHT - 20) { n.y = GAME_HEIGHT - 20; n.moveY = -1; }
     });
 
-    // --- BULLETS & COLLISIONS ---
+    // Bullets
     gameState.bullets.forEach((b) => {
       b.x += b.vx * dt;
       b.y += b.vy * dt;
       b.life -= dt;
 
       if (b.life > 0) {
-        // NPC Hit
         gameState.npcs.forEach((n) => {
           if (!n.dead && Math.hypot(n.x - b.x, n.y - b.y) < 25) {
             n.dead = true;
@@ -237,7 +247,6 @@ setInterval(() => {
           }
         });
 
-        // Player Hit
         Object.values(gameState.players).forEach((p) => {
           if (p.role === "hider" && !p.dead && Math.hypot(p.x - b.x, p.y - b.y) < 25) {
             p.dead = true;
@@ -251,10 +260,9 @@ setInterval(() => {
     });
     gameState.bullets = gameState.bullets.filter((b) => b.life > 0);
 
-    // --- WIN CONDITIONS ---
+    // Win Conditions
     const livingHiders = Object.values(gameState.players).filter(p => p.role === "hider" && !p.dead);
     const hunter = Object.values(gameState.players).find(p => p.role === "hunter");
-    
     let gameOverReason = null;
     let hunterWon = false;
 
@@ -275,9 +283,17 @@ setInterval(() => {
     }
   }
 
+  // Send tick (include Marks)
   io.emit("tick", {
     players: gameState.players,
-    npcs: gameState.npcs.map(n => ({x:Math.round(n.x), y:Math.round(n.y), dead:n.dead, color:n.color})), 
+    // Map NPCs to include 'mark'
+    npcs: gameState.npcs.map(n => ({
+        x: Math.round(n.x), 
+        y: Math.round(n.y), 
+        dead: n.dead, 
+        color: n.color,
+        mark: n.mark 
+    })), 
     bullets: gameState.bullets,
     timer: Math.round(gameState.timer),
     events: gameState.events 
